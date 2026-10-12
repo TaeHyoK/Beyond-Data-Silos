@@ -1,0 +1,2249 @@
+"""Single-call LLM writer for the fixed-format HTML investment report."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+from typing import Any
+
+from .html_report_spec import (
+    REPORT_SECTIONS,
+    RISK_DISPLAY_COLUMNS,
+    replace_english_grade_labels,
+)
+from shared.coerce import as_dict as _dict, is_finite_number
+from shared.evidence_cards import PRODUCT_DISCLOSURE_SCOPE_LABEL
+from shared.llm_clients import compact_json, execute_with_telemetry, is_transient_transport_error
+from .writer_handoff import (
+    EDITORIAL_PACKET_VERSION,
+    STRATEGY_DECISION_VERSION,
+    _krw_100m,
+    _metric_display,
+    _price_display,
+    _ratio_percent,
+    _signed_percentage_point,
+    validate_writer_editorial_packet,
+)
+
+
+DEFAULT_LLM_MODEL = "gpt-5.4"
+MISSING_VALUE = "데이터 추가 필요"
+WRITER_CACHE_VERSION = "22"
+DETERMINISTIC_WRITER_MODE = "deterministic"
+FREE_FORM_WRITER_MODE = "free_form"
+WRITER_MODES = {DETERMINISTIC_WRITER_MODE, FREE_FORM_WRITER_MODE}
+
+
+class HTMLReportWriterUnavailable(RuntimeError):
+    """Raised when the LLM HTML report writer cannot run."""
+
+
+def writer_request_fingerprint(
+    *,
+    writer_handoff: dict[str, Any],
+    model: str,
+    writer_mode: str = DETERMINISTIC_WRITER_MODE,
+    chart_catalog: dict[str, Any] | None = None,
+) -> str:
+    """Fingerprint every value that can change the single Writer LLM response."""
+
+    _validate_writer_input(writer_handoff)
+    writer_mode = _normalize_writer_mode(writer_mode)
+    payload = {
+        "cache_version": WRITER_CACHE_VERSION,
+        "contract_version": _writer_contract_version(writer_handoff),
+        "model": model,
+        "writer_mode": writer_mode,
+        "system_prompt": _system_prompt(
+            _writer_contract_version(writer_handoff), writer_mode=writer_mode
+        ),
+        "context": _build_context(
+            writer_handoff=writer_handoff,
+            writer_mode=writer_mode,
+            chart_catalog=chart_catalog,
+        ),
+        "response_format": writer_report_response_format(
+            writer_handoff,
+            writer_mode=writer_mode,
+            chart_catalog=chart_catalog,
+        ),
+    }
+    return hashlib.sha256(compact_json(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def request_html_report_payload(
+    *,
+    writer_handoff: dict[str, Any],
+    model: str = DEFAULT_LLM_MODEL,
+    api_key: str | None = None,
+    writer_mode: str = DETERMINISTIC_WRITER_MODE,
+    chart_catalog: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Request and return the raw Writer response before local validation."""
+
+    _validate_writer_input(writer_handoff)
+    resolved_api_key = api_key or os.getenv("OPENAI_API_KEY")
+    if not resolved_api_key:
+        raise HTMLReportWriterUnavailable("OPENAI_API_KEY is not set. Writer Agent requires LLM mode.")
+    writer_mode = _normalize_writer_mode(writer_mode)
+    context = _build_context(
+        writer_handoff=writer_handoff,
+        writer_mode=writer_mode,
+        chart_catalog=chart_catalog,
+    )
+    raw_payload, transport_metadata = _call_openai_writer(
+        context=context,
+        model=model,
+        api_key=resolved_api_key,
+        response_format=writer_report_response_format(
+            writer_handoff,
+            writer_mode=writer_mode,
+            chart_catalog=chart_catalog,
+        ),
+        include_metadata=True,
+    )
+    return raw_payload, {
+        "status": "applied",
+        "model": model,
+        "writer_mode": writer_mode,
+        "call_count": 1,
+        **transport_metadata,
+        "raw_payload": raw_payload,
+    }
+
+
+def validate_raw_writer_payload(payload: dict[str, Any]) -> None:
+    """Reject a Writer response that does not match the fixed report shell."""
+
+    shape_errors = _raw_payload_shape_errors(payload)
+    if shape_errors:
+        raise HTMLReportWriterUnavailable(
+            f"LLM writer returned invalid section structure: {shape_errors}"
+        )
+
+
+def normalize_report_payload(
+    payload: dict[str, Any],
+    *,
+    writer_handoff: dict[str, Any],
+    writer_mode: str = DETERMINISTIC_WRITER_MODE,
+    chart_catalog: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Normalize item containers without writing analytical fallback sentences."""
+
+    _validate_writer_input(writer_handoff)
+    writer_mode = _normalize_writer_mode(writer_mode)
+    is_editorial_packet = _is_editorial_packet(writer_handoff)
+    requested_chart_keys: list[str] | None = None
+    chart_selection_details: list[dict[str, Any]] | None = None
+    if chart_catalog is not None:
+        if is_editorial_packet:
+            chart_catalog = _grounded_chart_catalog_for_writer(
+                chart_catalog,
+                writer_handoff,
+            )
+        requested_chart_keys = _normalize_requested_chart_keys(
+            payload.get("requested_chart_keys"),
+            chart_catalog=chart_catalog,
+        )
+        if is_editorial_packet:
+            # Validate internal card links before visible card labels replace identifiers.
+            chart_selection_details = _normalize_chart_selection_details(
+                payload.get("chart_selection_details"),
+                requested_chart_keys=requested_chart_keys,
+                writer_handoff=writer_handoff,
+                chart_catalog=chart_catalog,
+            )
+    if is_editorial_packet:
+        payload = _enrich_writer_metadata(payload, writer_handoff)
+        if writer_mode == DETERMINISTIC_WRITER_MODE:
+            payload = _apply_deterministic_evidence_table(payload, writer_handoff)
+            payload = _apply_deterministic_risk_table(payload, writer_handoff)
+        payload = _replace_visible_card_keys(payload, writer_handoff)
+    target = _dict(writer_handoff.get("target"))
+    decision = _dict(writer_handoff.get("decision"))
+    metadata = _dict(payload.get("metadata"))
+    company_name = target.get("company_name") or MISSING_VALUE
+    normalized: dict[str, Any] = {
+        "metadata": {
+            "company_name": company_name,
+            "base_date": target.get("selected_date") or MISSING_VALUE,
+            "recommendation": decision.get("opinion") or decision.get("judgment") or MISSING_VALUE,
+            "investment_horizon": decision.get("investment_horizon") or MISSING_VALUE,
+            "data_coverage": decision.get("data_coverage") or MISSING_VALUE,
+            "decision_confidence": decision.get("decision_confidence") or MISSING_VALUE,
+            "report_title": replace_english_grade_labels(decision.get("headline")) if decision.get("headline") else (
+                f"{company_name} 투자 리서치"
+                if is_editorial_packet
+                else metadata.get("report_title") or f"{company_name} Investment Report"
+            ),
+            "stock_code": _stock_code(target.get("ticker")),
+            **_report_key_metrics(writer_handoff),
+        }
+    }
+    sections = _dict(payload.get("sections"))
+    normalized_sections: dict[str, Any] = {}
+    for section in REPORT_SECTIONS:
+        section_payload = _dict(sections.get(section["key"]))
+        normalized_items: dict[str, Any] = {}
+        for item_key, _title, item_type in section["items"]:
+            raw_item = section_payload.get(item_key)
+            normalized_items[item_key] = (
+                _normalize_table(raw_item, preserve_strategy_values=is_editorial_packet)
+                if item_type == "table"
+                else _normalize_text(
+                    raw_item,
+                    preserve_claim_units=is_editorial_packet,
+                    allow_empty=section["key"] == "data_limits",
+                )
+            )
+        normalized_sections[section["key"]] = normalized_items
+    normalized["sections"] = normalized_sections
+    if requested_chart_keys is not None:
+        normalized["requested_chart_keys"] = requested_chart_keys
+        if chart_selection_details is not None:
+            normalized["chart_selection_details"] = chart_selection_details
+    contract_version = _writer_contract_version(writer_handoff)
+    normalized["generation"] = {
+        "mode": (
+            "single_call_llm_free_form_writer_ablation"
+            if writer_mode == FREE_FORM_WRITER_MODE
+            else "single_call_llm_with_editorial_cards"
+        ),
+        "contract_version": contract_version,
+        "missing_value_policy": MISSING_VALUE,
+    }
+    return normalized
+
+
+def _call_openai_writer(
+    *,
+    context: dict[str, Any],
+    model: str,
+    api_key: str,
+    response_format: dict[str, Any] | None = None,
+    include_metadata: bool = False,
+) -> dict[str, Any] | tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        from openai import OpenAI
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise HTMLReportWriterUnavailable(f"openai package is unavailable: {exc}") from exc
+
+    timeout_seconds = max(1.0, float(os.getenv("LLM_TIMEOUT_SECONDS", "300")))
+    transport_retries = max(0, int(os.getenv("LLM_TRANSPORT_RETRIES", "0")))
+    client = OpenAI(api_key=api_key, timeout=timeout_seconds, max_retries=0)
+    payload, metadata = _request_openai_json(
+        client=client,
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": _system_prompt(
+                    str(context.get("contract_version") or ""),
+                    writer_mode=str(
+                        context.get("writer_mode") or DETERMINISTIC_WRITER_MODE
+                    ),
+                ),
+            },
+            {"role": "user", "content": compact_json(context)},
+        ],
+        response_format=response_format or {"type": "json_object"},
+        transport_retries=transport_retries,
+    )
+    return (payload, metadata) if include_metadata else payload
+
+
+def _request_openai_json(
+    *,
+    client: Any,
+    model: str,
+    messages: list[dict[str, str]],
+    response_format: dict[str, Any],
+    transport_retries: int = 0,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    request_payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        "response_format": response_format,
+    }
+    try:
+        response = execute_with_telemetry(
+            lambda: client.chat.completions.create(**request_payload),
+            request_payload=request_payload,
+            model=model,
+            step="writer:html_report",
+            usage_getter=lambda result: getattr(result, "usage", None),
+            max_attempts=transport_retries + 1,
+            retry_predicate=is_transient_transport_error,
+        )
+    except Exception as exc:  # pragma: no cover - network/API dependent
+        raise HTMLReportWriterUnavailable(f"LLM writer request failed: {exc}") from exc
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        raise HTMLReportWriterUnavailable("LLM writer returned no choices.")
+    choice = choices[0]
+    finish_reason = str(getattr(choice, "finish_reason", "") or "")
+    if finish_reason == "length":
+        raise HTMLReportWriterUnavailable(
+            "LLM writer response was truncated before the JSON object completed."
+        )
+    message = getattr(choice, "message", None)
+    refusal = str(getattr(message, "refusal", "") or "").strip()
+    if refusal:
+        raise HTMLReportWriterUnavailable(f"LLM writer refused the request: {refusal}")
+    content = getattr(message, "content", None)
+    if not content:
+        raise HTMLReportWriterUnavailable("LLM writer returned empty content.")
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise HTMLReportWriterUnavailable(f"LLM writer returned invalid JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTMLReportWriterUnavailable("LLM writer JSON must be an object.")
+    usage = getattr(response, "usage", None)
+    if isinstance(usage, dict):
+        usage_payload = dict(usage)
+    elif hasattr(usage, "model_dump"):
+        usage_payload = usage.model_dump()
+    elif usage is not None and hasattr(usage, "__dict__"):
+        usage_payload = {
+            key: value
+            for key, value in vars(usage).items()
+            if isinstance(value, (str, int, float, bool)) or value is None
+        }
+    else:
+        usage_payload = {}
+    return payload, {
+        "finish_reason": finish_reason or "unknown",
+        "refusal": "",
+        "usage": usage_payload,
+    }
+
+
+def _build_context(
+    *,
+    writer_handoff: dict[str, Any],
+    writer_mode: str = DETERMINISTIC_WRITER_MODE,
+    chart_catalog: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the compact generation context for the one Writer call."""
+
+    _validate_writer_input(writer_handoff)
+    writer_mode = _normalize_writer_mode(writer_mode)
+    context = _build_editorial_context(writer_handoff, writer_mode=writer_mode)
+    return _with_chart_selection_context(context, chart_catalog)
+
+
+def _build_editorial_context(
+    writer_packet: dict[str, Any],
+    *,
+    writer_mode: str = DETERMINISTIC_WRITER_MODE,
+) -> dict[str, Any]:
+    writer_mode = _normalize_writer_mode(writer_mode)
+    required = _dict(writer_packet.get("required_card_keys_by_component"))
+    free_form = writer_mode == FREE_FORM_WRITER_MODE
+    decision = _dict(writer_packet.get("decision"))
+    return {
+        "contract_version": str(writer_packet.get("packet_version") or EDITORIAL_PACKET_VERSION),
+        "writer_mode": writer_mode,
+        "task": "Strategy의 분석과 투자 의견을 보존해 한국어 기업 분석보고서를 편집한다.",
+        "output_contract": _output_contract(writer_packet, writer_mode=writer_mode),
+        "section_role_guidance": _section_role_guidance(),
+        "writing_rules": {
+            "strategy_judgment_lock": decision.get("judgment") or decision.get("opinion"),
+            "use_only_writer_input": True,
+            "required_card_keys_by_component": required,
+            "available_card_keys_by_component": writer_packet.get("available_card_keys_by_component", required),
+            "recommendation_bridge_lock": _dict(writer_packet.get("recommendation_bridge")),
+            "strategy_meaning_lock": (
+                "각 카드의 strategy_interpretation과 Strategy가 선택한 역할을 바꾸거나 새 인과관계로 확대하지 않는다. "
+                "output_contract에 제시된 숨은 검증 필드에는 해당 값을 정확히 복사한다."
+            ),
+            "evidence_tier_policy": (
+                "핵심 근거 표에는 decision_basis 카드만 사용한다. report_context 카드는 report_insights와 "
+                "해당 섹션의 설명을 구체화할 때만 사용하며 새로운 투자 방향을 만들지 않는다."
+            ),
+            "report_insight_policy": (
+                "report_insights를 그대로 반복하지 말고 연결된 카드의 관찰값과 함께 손익·재무상태, "
+                "가격·가치평가, 사건·사업 실행의 관계를 설명한다. 같은 insight_type이어도 독립적인 사건과 "
+                "가정이면 각각의 의미와 근거를 보존한다. 입력에 없는 원인은 추가하지 않는다."
+            ),
+            "key_evidence_row_policy": (
+                (
+                    "key_evidence_table의 각 required card를 입력 순서대로 정확히 한 행씩 직접 작성한다. "
+                    "숨은 card/Strategy 필드는 output_contract 값을 그대로 복사하고, 보이는 관찰·해석·영향은 "
+                    "입력 card의 의미와 표시 단위를 보존한다."
+                )
+                if free_form
+                else (
+                    "key_evidence_table의 rows는 빈 배열로 반환하고, _display_labels에 각 card를 설명하는 "
+                    "짧고 구체적인 독자용 근거명을 입력 순서대로 작성한다. 시스템은 이 근거명, "
+                    "reader_observation과 Strategy 해석으로 최종 행을 만든다."
+                )
+            ),
+            "claim_grounding_policy": (
+                "각 텍스트 문단의 실제 문장을 _claim_units에 그대로 복사하고, 문장마다 실제 사용한 "
+                "component 허용 card_keys를 연결한다. item.card_keys는 실제 인용한 근거의 합집합이며 "
+                "필수 근거를 포함한다. 사용 가능한 근거를 모두 인용할 필요는 없다."
+            ),
+            "concrete_event_policy": (
+                "전망 문단은 Strategy가 해석한 기간 중 사업 변화를 중심으로 작성한다. 사건의 구체적 내용과 "
+                "기존 사업에서 달라진 점, 12개월 전망에 미치는 의미 및 필요한 가정을 연결한다. "
+                "정기공시의 성장률을 반복하거나 '재무 기여 미확인'만 덧붙이는 문단으로 대체하지 않는다. "
+                "이미 실적에 포함된 보도와 이후 새로 발생한 변화를 구분한다. 입력에 중요하다고 해석된 사건이 "
+                "없으면 뉴스 수를 채우려고 추가하지 않으며 새로운 분석이나 인과를 만들지 않는다. "
+                "뉴스 card가 여러 개이면 고객사 공급·수주·생산·투자처럼 대상, 제품, 시점이 확인되는 사건을 "
+                "일반적인 전략·기술 방향 보도보다 먼저 사용한다. 입력에 구체적 사건이 있는데 포괄적인 기술 강화 "
+                "문구만 나열하지 않는다. 월별 뉴스 배열은 자료를 묶은 구간이므로 사건 발생일이나 실적 대상 "
+                "기간으로 바꾸지 않는다. 각 기사의 보도일과 사건 발생일을 구분하고, 하위 분석의 해석을 기사에 "
+                "직접 명시된 사실로 바꾸지 않는다."
+            ),
+            "risk_row_policy": (
+                (
+                    "writer_input.risk_factors의 각 risk를 입력 순서대로 정확히 한 행씩 직접 작성한다. "
+                    "숨은 basis/Strategy 필드는 output_contract 값을 그대로 복사한다."
+                )
+                if free_form
+                else (
+                    "risk_monitoring_matrix의 rows는 빈 배열로 반환한다. 시스템이 Strategy risk와 "
+                    "현재 판단에 미치는 영향으로 최종 행을 구성한다."
+                )
+            ),
+            "current_input_only": (
+                "기준일까지 확인된 사실과 Strategy가 제시한 향후 12개월 전망·가정을 구분해서 전달한다. "
+                "입력에 없는 미래 수치나 일정을 추가하지 않는다."
+            ),
+            "evidence_focus": (
+                "Strategy가 선택한 카드 중 해당 섹션의 질문에 직접 답하는 내용만 쓴다. "
+                "같은 사건이나 수치는 가장 적합한 한 섹션에서 설명하고 다른 섹션에서는 되풀이하지 않는다."
+            ),
+            "evidence_label_policy": (
+                "근거명은 카드 종류를 반복하는 일반 분류명이 아니라 해당 기업에서 관찰된 핵심 내용을 "
+                "2~8어절로 구체화한다. 투자 방향이나 입력에 없는 사실은 근거명에 추가하지 않는다."
+            ),
+            "inline_html": ["<strong>"],
+        },
+        "writer_input": build_writer_llm_input(writer_packet),
+    }
+
+
+def build_writer_llm_input(writer_handoff: dict[str, Any]) -> dict[str, Any]:
+    """Remove audit-only provenance and duplicated counter-evidence from LLM input."""
+
+    _validate_writer_input(writer_handoff)
+    compact = json.loads(json.dumps(writer_handoff, ensure_ascii=False))
+    compact["target"] = {
+        key: value
+        for key, value in _dict(compact.get("target")).items()
+        if key != "run_key"
+    }
+    return compact
+
+
+def _with_chart_selection_context(
+    context: dict[str, Any],
+    chart_catalog: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Expose only reader-facing chart choices to the Writer call."""
+
+    if chart_catalog is None:
+        return context
+    available = _grounded_available_charts(
+        _public_available_charts(chart_catalog),
+        context,
+    )
+    max_selected = _max_selected_charts(chart_catalog, len(available))
+    context["available_charts"] = available
+    context["chart_selection_rules"] = {
+        "max_selected_charts": max_selected,
+        "recommended_chart_count": 2,
+        "allowed_chart_keys": [item["chart_key"] for item in available],
+        "selection_policy": (
+            "차트는 2개 안팎을 권장하되 개수 때문에 필요한 관찰을 제외하지 않는다. "
+            "최종 판단에 가장 큰 영향을 준 basis card의 관찰을 독자가 직접 확인할 수 있는 차트만 선택한다. "
+            "두 차트가 같은 판단 근거를 반복하면 더 직접적인 하나만 선택한다. 한 차트의 basis_card_keys가 "
+            "다른 차트의 부분집합이고 같은 관찰을 시각화한다면 더 넓은 근거를 보여주는 차트 하나만 남긴다. "
+            "회사나 업종에 따라 필요한 "
+            "차트가 다르므로 특정 차트 종류를 의무적으로 선택하지 않는다. 본문에 없는 주장이나 결론을 "
+            "만들기 위한 차트는 선택하지 않는다. 각 차트의 basis_card_keys는 "
+            "compatible_basis_card_keys 안에서만 선택한다."
+        ),
+        "empty_selection_allowed": True,
+    }
+    output_contract = _dict(context.get("output_contract"))
+    output_contract["requested_chart_keys"] = (
+        f"available_charts의 chart_key 중 중복 없이 최대 {max_selected}개인 문자열 배열"
+    )
+    if str(context.get("contract_version") or "") == EDITORIAL_PACKET_VERSION:
+        output_contract["chart_selection_details"] = (
+            "requested_chart_keys와 같은 순서의 배열. 각 항목은 chart_key, "
+            "최종 판단에 실제 사용된 basis_card_keys, 내부용 선택 이유, 차트에서 직접 확인되는 관찰, "
+            "그 관찰이 대상기업 판단에 미치는 의미를 포함한다."
+        )
+    context["output_contract"] = output_contract
+    return context
+
+
+def _public_available_charts(chart_catalog: dict[str, Any]) -> list[dict[str, Any]]:
+    public_fields = (
+        "chart_key",
+        "title",
+        "description",
+        "compatible_card_keys",
+        "compatible_basis_card_keys",
+        "suitable_sections",
+        "interpretation_limit",
+        "chart_facts",
+    )
+    charts: list[dict[str, Any]] = []
+    for item in chart_catalog.get("available_charts") or []:
+        if not isinstance(item, dict) or not str(item.get("chart_key") or "").strip():
+            continue
+        charts.append({key: item.get(key) for key in public_fields if key in item})
+    return charts
+
+
+def _grounded_available_charts(
+    charts: list[dict[str, Any]],
+    context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Keep charts that can be grounded in cards selected by Strategy."""
+
+    writer_input = _dict(context.get("writer_input"))
+    selected_card_keys = set(_dict(writer_input.get("cards")))
+    target_peer_card_keys = {
+        str(item.get("basis_card_key") or "")
+        for item in writer_input.get("target_peer_context") or []
+        if isinstance(item, dict) and str(item.get("basis_card_key") or "").strip()
+    }
+    if not selected_card_keys:
+        return charts
+    grounded: list[dict[str, Any]] = []
+    for chart in charts:
+        compatible = _clean_identifiers(chart.get("compatible_card_keys"))
+        if not compatible:
+            grounded.append(chart)
+            continue
+        linked = [key for key in compatible if key in selected_card_keys]
+        if str(chart.get("chart_key") or "").startswith("peer_") or str(
+            chart.get("chart_key") or ""
+        ) == "liquidity_leverage":
+            linked = [key for key in linked if key in target_peer_card_keys]
+        if not linked:
+            continue
+        item = dict(chart)
+        item["compatible_basis_card_keys"] = linked
+        grounded.append(item)
+    return grounded
+
+
+def _grounded_chart_catalog_for_writer(
+    chart_catalog: dict[str, Any],
+    writer_handoff: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a catalog limited to Strategy-selected, chart-compatible evidence."""
+
+    grounded = dict(chart_catalog)
+    grounded["available_charts"] = _grounded_available_charts(
+        _public_available_charts(chart_catalog),
+        {
+            "writer_input": {
+                "cards": _dict(writer_handoff.get("cards")),
+                "target_peer_context": writer_handoff.get("target_peer_context") or [],
+            }
+        },
+    )
+    return grounded
+
+
+def _available_chart_keys(chart_catalog: dict[str, Any]) -> list[str]:
+    return [str(item["chart_key"]) for item in _public_available_charts(chart_catalog)]
+
+
+def _max_selected_charts(chart_catalog: dict[str, Any], available_count: int) -> int:
+    # Available, distinct chart keys are the only structural bound. The former
+    # two-chart layout target is guidance, not a reason to drop a valid choice.
+    return available_count
+
+
+def _normalize_requested_chart_keys(
+    value: Any,
+    *,
+    chart_catalog: dict[str, Any],
+) -> list[str]:
+    if not isinstance(value, list):
+        raise HTMLReportWriterUnavailable("requested_chart_keys must be an array.")
+    requested = [str(item).strip() for item in value if str(item).strip()]
+    if len(requested) != len(set(requested)):
+        raise HTMLReportWriterUnavailable("requested_chart_keys must not contain duplicates.")
+    public_charts = _public_available_charts(chart_catalog)
+    available = {str(item["chart_key"]) for item in public_charts}
+    unknown = [key for key in requested if key not in available]
+    if unknown:
+        raise HTMLReportWriterUnavailable(
+            f"Writer selected unavailable chart key(s): {unknown}"
+        )
+    max_selected = _max_selected_charts(chart_catalog, len(available))
+    if len(requested) > max_selected:
+        raise HTMLReportWriterUnavailable(
+            f"Writer may select at most {max_selected} chart(s)."
+        )
+    return requested
+
+
+def _normalize_chart_selection_details(
+    value: Any,
+    *,
+    requested_chart_keys: list[str],
+    writer_handoff: dict[str, Any],
+    chart_catalog: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Validate Writer chart choices without deciding which chart is preferable."""
+
+    if not isinstance(value, list):
+        raise HTMLReportWriterUnavailable("chart_selection_details must be an array.")
+    if len(value) != len(requested_chart_keys):
+        raise HTMLReportWriterUnavailable(
+            "chart_selection_details must match requested_chart_keys one-to-one."
+        )
+    public_charts = _public_available_charts(chart_catalog)
+    available = {str(item["chart_key"]) for item in public_charts}
+    chart_specs = {str(item["chart_key"]): item for item in public_charts}
+    allowed_cards = set(_dict(writer_handoff.get("cards")))
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise HTMLReportWriterUnavailable(
+                f"chart_selection_details[{index}] must be an object."
+            )
+        chart_key = str(item.get("chart_key") or "").strip()
+        if chart_key not in available:
+            raise HTMLReportWriterUnavailable(
+                f"Writer linked an unavailable chart key: {chart_key}"
+            )
+        if chart_key in seen:
+            raise HTMLReportWriterUnavailable(
+                "chart_selection_details must not contain duplicate chart keys."
+            )
+        seen.add(chart_key)
+        basis_card_keys = _clean_identifiers(item.get("basis_card_keys"))
+        if not basis_card_keys:
+            raise HTMLReportWriterUnavailable(
+                f"chart_selection_details[{index}] requires basis_card_keys."
+            )
+        unknown_cards = sorted(set(basis_card_keys) - allowed_cards)
+        if unknown_cards:
+            raise HTMLReportWriterUnavailable(
+                f"Chart selection references unknown Writer card key(s): {unknown_cards}"
+            )
+        compatible_cards = set(
+            _clean_identifiers(
+                _dict(chart_specs.get(chart_key)).get("compatible_basis_card_keys")
+                or _dict(chart_specs.get(chart_key)).get("compatible_card_keys")
+            )
+        )
+        if compatible_cards and not set(basis_card_keys).issubset(compatible_cards):
+            raise HTMLReportWriterUnavailable(
+                f"Chart selection uses an incompatible basis card: {chart_key}"
+            )
+        selection_reason = str(item.get("selection_reason") or "").strip()
+        if not selection_reason:
+            raise HTMLReportWriterUnavailable(
+                f"chart_selection_details[{index}] requires selection_reason."
+            )
+        chart_observation = str(item.get("chart_observation") or "").strip()
+        if not chart_observation:
+            raise HTMLReportWriterUnavailable(
+                f"chart_selection_details[{index}] requires chart_observation."
+            )
+        investment_interpretation = str(
+            item.get("investment_interpretation") or ""
+        ).strip()
+        if not investment_interpretation:
+            raise HTMLReportWriterUnavailable(
+                f"chart_selection_details[{index}] requires investment_interpretation."
+            )
+        normalized.append(
+            {
+                "chart_key": chart_key,
+                "basis_card_keys": basis_card_keys,
+                "selection_reason": selection_reason,
+                "chart_observation": chart_observation,
+                "investment_interpretation": investment_interpretation,
+            }
+        )
+    if [item["chart_key"] for item in normalized] != requested_chart_keys:
+        raise HTMLReportWriterUnavailable(
+            "chart_selection_details order must match requested_chart_keys."
+        )
+    return normalized
+
+
+def _section_keys() -> list[str]:
+    return [section["key"] for section in REPORT_SECTIONS]
+
+
+def _raw_payload_shape_errors(payload: dict[str, Any]) -> list[str]:
+    sections = payload.get("sections")
+    if not isinstance(sections, dict):
+        return ["sections must be an object."]
+    expected = set(_section_keys())
+    actual = set(sections)
+    errors: list[str] = []
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing:
+        errors.append(f"Missing top-level section key(s): {missing}")
+    if unexpected:
+        errors.append(f"Unexpected top-level section key(s): {unexpected}")
+    nested_locations: list[str] = []
+    for parent_key, parent_value in sections.items():
+        if not isinstance(parent_value, dict):
+            continue
+        nested = sorted(expected.intersection(parent_value))
+        if nested:
+            nested_locations.append(f"{parent_key} contains nested section key(s): {nested}")
+    if nested_locations:
+        errors.append("; ".join(nested_locations))
+    section_specs = {section["key"]: {item[0] for item in section["items"]} for section in REPORT_SECTIONS}
+    for section_key, expected_items in section_specs.items():
+        section_payload = sections.get(section_key)
+        if not isinstance(section_payload, dict):
+            errors.append(f"{section_key} must be an object")
+            continue
+        actual_items = set(section_payload)
+        if actual_items != expected_items:
+            errors.append(
+                f"{section_key} item keys must be {sorted(expected_items)}, got {sorted(actual_items)}"
+            )
+    forbidden_keys = sorted(_find_keys(payload).intersection({"target_price", "view_change_conditions", "view_change"}))
+    if forbidden_keys:
+        errors.append(f"Forbidden output key(s): {forbidden_keys}")
+    return errors
+
+
+def _find_keys(value: Any) -> set[str]:
+    keys: set[str] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            keys.add(str(key))
+            keys.update(_find_keys(child))
+    elif isinstance(value, list):
+        for child in value:
+            keys.update(_find_keys(child))
+    return keys
+
+
+def _section_role_guidance() -> list[dict[str, Any]]:
+    roles = {
+        "investment_call_thesis": {
+            "reader_question": (
+                "현재 판단 방향과 투자기간은 무엇이며, 무엇이 결론을 결정했고 가장 강한 대안은 "
+                "왜 채택되지 않았는가?"
+            ),
+            "content_focus": (
+                "최종 투자 의견과 결정적 이유를 결론부터 제시하고, 대안과의 비교를 다룬 뒤 현재 의견을 "
+                "선택한 이유로 끝낸다. 상세 수치는 표에 맡긴다."
+            ),
+        },
+        "business_market_context": {
+            "reader_question": "손익과 현금흐름은 어떻게 달라졌으며, 별도로 현재 가격과 가치평가에서 무엇을 판단할 수 있는가?",
+            "content_focus": (
+                "performance_and_financial_position 및 price_and_valuation 분석을 사용해 영업 수익성, "
+                "현금창출, 시장 가격의 관계를 설명한다. 결론의 투자 의견 문구는 반복하지 않는다."
+            ),
+        },
+        "key_evidence_table": {
+            "reader_question": "재무 추세, 제품 매출 구성, 선택일 밸류에이션, 시장과 대상기업 판단에 사용된 비교 지표의 핵심 수치는 무엇인가?",
+            "content_focus": "서로 다른 증거 축을 행으로 분리하고 관찰값·해석·판단 영향을 함께 쓴다. 비교 지표는 대상기업 판단에 사용된 경우에만 포함한다.",
+        },
+        "catalysts_execution": {
+            "reader_question": "사업과 실적의 향후 전망은 무엇이며 어떤 조건을 전제로 하는가?",
+            "content_focus": (
+                "Strategy가 제시한 중요한 사건은 무엇이 바뀌었는지와 사업·전망에 미치는 의미를 설명한다. "
+                "공시상 실적 추세를 반복하는 것으로 사건 설명을 대신하지 않는다. "
+                "입력에 포함된 사건 중 고객사 공급·수주·생산·투자처럼 사업 연계가 구체적인 사건을 "
+                "우선 설명하고, 사업 실행의 의미와 확인되지 않은 재무 기여를 구분한다."
+            ),
+        },
+        "risk_monitoring_matrix": {
+            "reader_question": "확인된 위험은 무엇이고 현재 투자 판단에 어떤 영향을 미치는가?",
+            "content_focus": (
+                "risks의 각 항목만 리스크 행으로 만들고 대응하는 current_implication을 판단 영향에 연결한다. "
+                "risks에 없는 데이터 부재나 촉매 불확실성은 새 리스크 행으로 만들지 않는다."
+            ),
+        },
+        "data_limits": {
+            "reader_question": "자료의 기준 시점과 현재 판단의 핵심 해석 한계는 무엇인가?",
+            "content_focus": (
+                "Strategy가 제시한 실질적인 판단 한계와 필요한 자료 기준만 설명한다. residual_uncertainty가 "
+                "투자의견이 바뀔 수 있는 조건을 제시하면 그 조건을 보존한다. 제시된 내용이 없으면 빈 배열을 "
+                "반환한다. 새로운 의견 전환 조건이나 일반적인 자료 부족 문구를 만들지 않는다."
+            ),
+        },
+    }
+    return [{"section_key": section["key"], "title": section["title"], **roles[section["key"]]} for section in REPORT_SECTIONS]
+
+
+def _output_contract(
+    writer_packet: dict[str, Any],
+    *,
+    writer_mode: str = DETERMINISTIC_WRITER_MODE,
+) -> dict[str, Any]:
+    writer_mode = _normalize_writer_mode(writer_mode)
+    free_form = writer_mode == FREE_FORM_WRITER_MODE
+    evidence_columns = _evidence_display_columns(writer_packet)
+    required = _dict(writer_packet.get("required_card_keys_by_component"))
+    cards = _dict(writer_packet.get("cards"))
+    risks = [
+        item for item in writer_packet.get("risk_factors") or [] if isinstance(item, dict)
+    ]
+    sections: dict[str, Any] = {}
+    for section in REPORT_SECTIONS:
+        component = section["key"]
+        card_keys = _clean_identifiers(required.get(component))
+        section_items: dict[str, Any] = {}
+        for item_key, _title, item_type in section["items"]:
+            if component == "key_evidence_table":
+                section_items[item_key] = {
+                    "columns": (
+                        list(evidence_columns)
+                        if free_form
+                        else list(evidence_columns)
+                    ),
+                    "rows": (
+                        [
+                            {
+                                "핵심 근거": "card label을 독자용 한국어로 작성",
+                                "확인된 수치·사실": "reader_observation을 단위 변경 없이 작성",
+                                _evidence_interpretation_column(writer_packet): "strategy_interpretation 의미를 보존해 작성",
+                                "_card_key": card_key,
+                                "_strategy_interpretation": _dict(cards.get(card_key)).get(
+                                    "strategy_interpretation"
+                                ),
+                            }
+                            for card_key in card_keys
+                        ]
+                        if free_form
+                        else []
+                    ),
+                    "card_keys": card_keys,
+                }
+                if not free_form:
+                    section_items[item_key]["_display_labels"] = [
+                        {
+                            "card_key": card_key,
+                            "display_label": "해당 기업의 관찰을 구체화한 2~8어절 근거명",
+                        }
+                        for card_key in card_keys
+                    ]
+            elif component == "risk_monitoring_matrix":
+                section_items[item_key] = {
+                    "columns": (
+                        list(RISK_DISPLAY_COLUMNS)
+                        if free_form
+                        else list(RISK_DISPLAY_COLUMNS)
+                    ),
+                    "rows": (
+                        [
+                            {
+                                "리스크 요인": "risk를 독자용 한국어로 요약",
+                                "현재 확인된 내용": "Strategy risk 의미를 보존해 작성",
+                                "투자 판단에 미치는 영향": "current_implication을 보존해 작성",
+                                "_basis_card_keys": _clean_identifiers(
+                                    risk.get("basis_card_keys")
+                                ),
+                                "_strategy_risk_summary": risk.get("risk_summary"),
+                            }
+                            for risk in risks
+                        ]
+                        if free_form
+                        else []
+                    ),
+                    "card_keys": card_keys,
+                }
+            elif item_type == "table":
+                section_items[item_key] = {
+                    "columns": ["항목", "내용"],
+                    "rows": [],
+                    "card_keys": card_keys,
+                }
+            else:
+                if component == "investment_call_thesis":
+                    section_items[item_key] = {
+                        "paragraphs": [
+                            "최종 투자 의견과 그것을 결정한 근거를 결론부터 쓴 문단",
+                            "decision_rationale의 비교와 counterview의 대안을 다룬 뒤 현재 의견을 선택한 이유로 끝나는 문단",
+                        ],
+                        "bullets": [],
+                        "card_keys": card_keys,
+                        "_claim_units": [
+                            {
+                                "claim": "paragraphs에 실제로 작성한 완결 문장",
+                                "card_keys": card_keys,
+                                "limitation_categories": [],
+                            }
+                        ],
+                    }
+                    continue
+                limitation_claim_units = [
+                    {
+                        "claim": (
+                            f"{item.get('category')} 한계를 독자가 이해할 수 있게 설명한 완결 문장"
+                        ),
+                        "card_keys": _clean_identifiers(item.get("basis_card_keys")),
+                        "limitation_categories": [str(item.get("category"))],
+                    }
+                    for item in writer_packet.get("required_limitations") or []
+                    if isinstance(item, dict) and item.get("category")
+                ]
+                section_items[item_key] = {
+                    "paragraphs": [
+                        "독립적인 논거·가정과 근거 연결을 보존하는 한국어 분석 문단"
+                    ],
+                    "bullets": [],
+                    "card_keys": card_keys,
+                    "_claim_units": (
+                        limitation_claim_units
+                        if component == "data_limits" and limitation_claim_units
+                        else [
+                            {
+                                "claim": "paragraphs에 실제로 작성한 완결 문장",
+                                "card_keys": card_keys,
+                                "limitation_categories": [],
+                            }
+                        ]
+                    ),
+                }
+                if component == "data_limits":
+                    if not limitation_claim_units and not str(_dict(writer_packet.get("recommendation_bridge")).get("residual_uncertainty") or "").strip():
+                        section_items[item_key]["paragraphs"] = []
+                        section_items[item_key]["_claim_units"] = []
+                    section_items[item_key]["_limitation_categories"] = [
+                        str(item.get("category"))
+                        for item in writer_packet.get("required_limitations") or []
+                        if isinstance(item, dict) and item.get("category")
+                    ]
+        sections[component] = section_items
+    return {"metadata": {"report_title": "문자열"}, "sections": sections}
+
+
+def writer_report_response_format(
+    writer_handoff: dict[str, Any],
+    *,
+    writer_mode: str = DETERMINISTIC_WRITER_MODE,
+    chart_catalog: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the API response format for the active Writer contract."""
+
+    _validate_writer_input(writer_handoff)
+    writer_mode = _normalize_writer_mode(writer_mode)
+    if chart_catalog is not None:
+        chart_catalog = _grounded_chart_catalog_for_writer(
+            chart_catalog,
+            writer_handoff,
+        )
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "writer_report_payload",
+            "strict": True,
+            "schema": _writer_report_schema(
+                writer_handoff,
+                writer_mode=writer_mode,
+                chart_catalog=chart_catalog,
+            ),
+        },
+    }
+
+
+def _writer_report_schema(
+    writer_packet: dict[str, Any],
+    *,
+    writer_mode: str = DETERMINISTIC_WRITER_MODE,
+    chart_catalog: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    writer_mode = _normalize_writer_mode(writer_mode)
+    free_form = writer_mode == FREE_FORM_WRITER_MODE
+    evidence_columns = _evidence_display_columns(writer_packet)
+    required_by_component = _dict(writer_packet.get("required_card_keys_by_component"))
+    available_by_component = _dict(writer_packet.get("available_card_keys_by_component", required_by_component))
+    risks = [
+        item for item in writer_packet.get("risk_factors") or [] if isinstance(item, dict)
+    ]
+    all_card_keys = _clean_identifiers(list(_dict(writer_packet.get("cards")).keys()))
+    limitation_categories = _clean_identifiers(
+        [
+            item.get("category")
+            for item in writer_packet.get("required_limitations") or []
+            if isinstance(item, dict) and item.get("category")
+        ]
+    )
+    section_properties: dict[str, Any] = {}
+    for section in REPORT_SECTIONS:
+        component = section["key"]
+        allowed_card_keys = _clean_identifiers(available_by_component.get(component))
+        item_properties: dict[str, Any] = {}
+        for item_key, _title, item_type in section["items"]:
+            if item_type == "table":
+                expected_columns = (
+                    (
+                        list(evidence_columns)
+                        if free_form
+                        else list(evidence_columns)
+                    )
+                    if component == "key_evidence_table"
+                    else (
+                        list(RISK_DISPLAY_COLUMNS)
+                        if free_form
+                        else list(RISK_DISPLAY_COLUMNS)
+                    )
+                    if component == "risk_monitoring_matrix"
+                    else ["항목", "내용"]
+                )
+                row_schema = _strict_schema_object({})
+                row_count = 0
+                if free_form and component == "key_evidence_table":
+                    row_fields = {
+                            "핵심 근거": {"type": "string"},
+                            "확인된 수치·사실": {"type": "string"},
+                            _evidence_interpretation_column(writer_packet): {"type": "string"},
+                            "_card_key": {
+                                "type": "string",
+                                "enum": allowed_card_keys,
+                            },
+                            "_strategy_interpretation": {"type": "string"},
+                    }
+                    row_schema = _strict_schema_object(row_fields)
+                    row_count = len(allowed_card_keys)
+                elif free_form and component == "risk_monitoring_matrix":
+                    row_schema = _strict_schema_object(
+                        {
+                            "리스크 요인": {"type": "string"},
+                            "현재 확인된 내용": {"type": "string"},
+                            "투자 판단에 미치는 영향": {"type": "string"},
+                            "_basis_card_keys": _bounded_string_array_schema(
+                                all_card_keys,
+                                min_items=1,
+                                max_items=len(all_card_keys),
+                            ),
+                            "_strategy_risk_summary": {"type": "string"},
+                        }
+                    )
+                    row_count = len(risks)
+                table_properties: dict[str, Any] = {
+                    "columns": _bounded_string_array_schema(
+                        expected_columns,
+                        exact_count=len(expected_columns),
+                    ),
+                    "rows": {
+                        "type": "array",
+                        "items": row_schema,
+                        "minItems": row_count,
+                        "maxItems": row_count,
+                    },
+                    "card_keys": _bounded_string_array_schema(
+                        allowed_card_keys,
+                        exact_count=len(allowed_card_keys),
+                    ),
+                }
+                if not free_form and component == "key_evidence_table":
+                    table_properties["_display_labels"] = {
+                        "type": "array",
+                        "items": _strict_schema_object(
+                            {
+                                "card_key": {
+                                    "type": "string",
+                                    "enum": allowed_card_keys,
+                                },
+                                "display_label": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                },
+                            }
+                        ),
+                        "minItems": len(allowed_card_keys),
+                        "maxItems": len(allowed_card_keys),
+                    }
+                item_properties[item_key] = _strict_schema_object(table_properties)
+                continue
+
+            claim_unit = _strict_schema_object(
+                {
+                    "claim": {"type": "string"},
+                    "card_keys": _bounded_string_array_schema(
+                        allowed_card_keys,
+                        min_items=0,
+                        max_items=len(allowed_card_keys),
+                    ),
+                    "limitation_categories": _bounded_string_array_schema(
+                        limitation_categories if component == "data_limits" else [],
+                        min_items=0,
+                        max_items=(
+                            len(limitation_categories)
+                            if component == "data_limits"
+                            else 0
+                        ),
+                    ),
+                }
+            )
+            text_properties: dict[str, Any] = {
+                "paragraphs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 0 if component == "data_limits" else 1,
+                },
+                "bullets": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 0,
+                    "maxItems": 0,
+                },
+                "card_keys": _bounded_string_array_schema(
+                    allowed_card_keys,
+                    min_items=len(_clean_identifiers(required_by_component.get(component))),
+                    max_items=len(allowed_card_keys),
+                ),
+                "_claim_units": {
+                    "type": "array",
+                    "items": claim_unit,
+                    "minItems": 0 if component == "data_limits" else 1,
+                },
+            }
+            if component == "data_limits":
+                text_properties["_limitation_categories"] = (
+                    _bounded_string_array_schema(
+                        limitation_categories,
+                        exact_count=len(limitation_categories),
+                    )
+                )
+            item_properties[item_key] = _strict_schema_object(text_properties)
+        section_properties[component] = _strict_schema_object(item_properties)
+    top_level_properties: dict[str, Any] = {
+        "metadata": _strict_schema_object(
+            {"report_title": {"type": "string"}}
+        ),
+        "sections": _strict_schema_object(section_properties),
+    }
+    if chart_catalog is not None:
+        chart_keys = _available_chart_keys(chart_catalog)
+        max_selected = _max_selected_charts(chart_catalog, len(chart_keys))
+        chart_selection_schema = _bounded_string_array_schema(
+            chart_keys,
+            min_items=0,
+            max_items=max_selected,
+        )
+        top_level_properties["requested_chart_keys"] = chart_selection_schema
+        top_level_properties["chart_selection_details"] = {
+            "type": "array",
+            "items": _strict_schema_object(
+                {
+                    "chart_key": {"type": "string", "enum": chart_keys},
+                    "basis_card_keys": _bounded_string_array_schema(
+                        all_card_keys,
+                        min_items=1,
+                        max_items=len(all_card_keys),
+                    ),
+                    "selection_reason": {"type": "string"},
+                    "chart_observation": {
+                        "type": "string",
+                        "pattern": r"\S",
+                    },
+                    "investment_interpretation": {
+                        "type": "string",
+                        "pattern": r"\S",
+                    },
+                }
+            ),
+            "minItems": 0,
+            "maxItems": max_selected,
+        }
+    return _strict_schema_object(top_level_properties)
+
+
+def _strict_schema_object(properties: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+def _bounded_string_array_schema(
+    allowed_values: list[str],
+    *,
+    exact_count: int | None = None,
+    min_items: int | None = None,
+    max_items: int | None = None,
+) -> dict[str, Any]:
+    item_schema: dict[str, Any] = {"type": "string"}
+    if allowed_values:
+        item_schema["enum"] = allowed_values
+    schema: dict[str, Any] = {"type": "array", "items": item_schema}
+    if exact_count is not None:
+        schema["minItems"] = exact_count
+        schema["maxItems"] = exact_count
+    else:
+        if min_items is not None:
+            schema["minItems"] = min_items
+        if max_items is not None:
+            schema["maxItems"] = max_items
+    return schema
+
+
+def _system_prompt(
+    contract_version: str = "",
+    *,
+    writer_mode: str = DETERMINISTIC_WRITER_MODE,
+) -> str:
+    writer_mode = _normalize_writer_mode(writer_mode)
+    if contract_version != EDITORIAL_PACKET_VERSION:
+        raise ValueError("writer contract_version must be an editorial packet version")
+    return _editorial_system_prompt(writer_mode=writer_mode)
+
+
+def _editorial_system_prompt(
+    *,
+    writer_mode: str = DETERMINISTIC_WRITER_MODE,
+) -> str:
+    writer_mode = _normalize_writer_mode(writer_mode)
+    assembly_policy = (
+        """
+- investment_call_thesis의 paragraphs와 _claim_units를 직접 작성한다.
+- key_evidence_table은 output_contract의 각 card에 대응하는 행을 순서대로 직접 작성한다.
+- risk_monitoring_matrix는 output_contract의 각 risk에 대응하는 행을 순서대로 직접 작성한다.
+- 밑줄로 시작하는 Strategy/card/risk 필드는 output_contract 값을 정확히 복사하며 보이는 셀에는 노출하지 않는다.
+""".strip()
+        if writer_mode == FREE_FORM_WRITER_MODE
+        else """
+- investment_call_thesis의 paragraphs와 _claim_units를 직접 작성한다. Strategy의 thesis와 최종 투자 의견의 의미를 보존하되 문구를 그대로 복사하지 않고, 중복되거나 어색한 표현을 자연스러운 조사보고서 문장으로 정리한다. 문단 수를 목표로 삼지 않고 근거 비교와 선택 이유를 충분히 설명한다. 첫 문단에는 decision.investment_horizon을 표시된 그대로 한 번 포함한다.
+- key_evidence_table의 rows는 빈 배열로 반환하고, 각 card의 구체적인 독자용 근거명을 _display_labels에 입력 순서대로 작성한다. 최종 표의 사실·수치와 투자 해석은 시스템이 만든다.
+- risk_monitoring_matrix의 rows는 빈 배열로 반환한다. 최종 리스크 행도 시스템이 Strategy 의미와 확인 항목으로 만든다.
+""".strip()
+    )
+    return f"""
+너는 범용 상장기업 리서치 Writer Agent다. 반드시 유효한 JSON object 하나만 반환한다.
+
+역할 경계:
+- Strategy가 이미 판단한 해석과 판단 영향을 독자가 읽기 좋은 한국어로 편집한다.
+- Strategy 판단을 재평가하거나 새로운 해석, 인과관계, 전망, 수치, 회사, 제품·서비스, 이벤트를 만들지 않는다.
+- 문장과 표를 편집할 때 대상기업·지주회사·그룹·계열사 중 각 실적·수치·사건의 주체와 연결·별도 기준을 유지한다. 기업명을 생략해 그룹 수치가 대상기업 수치로 읽히게 하지 않는다. Strategy가 근거에 따라 설명한 대상기업의 사업 변화와 그룹 성과에 대한 기여를 보존하며, 이를 기업 구분에 관한 내부 검토 문구로 대체하지 않는다. 입력에 없는 기여 원인·규모를 보충하지 않고, 판단에 실질적인 영향을 주는 불확실성은 해당 범위에서 유지한다.
+- 판단 방향과 투자기간을 변경하지 않는다.
+- 투자 판단 요약은 최종 투자 의견과 그것을 결정한 근거를 결론부터 쓴다. recommendation_bridge.decision_rationale의 근거 간 우선순위와 대안 의견을 채택하지 않은 이유를 보존한다. 각 근거는 지지·반대로 나누지 않고 투자 판단상 의미로 서술하며, 별도 소제목이나 정해진 비교표를 추가하지 않는다.
+- recommendation_bridge.counterview에 대안을 뒷받침하는 구체적 사실·가정이 있으면 그 내용과 근거를 보존하고 '긍정 요인도 있다' 같은 일반론으로 대체하지 않는다. 대안을 설명한 뒤에는 그럼에도 현재 의견을 선택한 이유로 문단을 끝낸다. 다른 절에서 설명한 사실은 되풀이하지 않아도 되지만 대안과의 비교 관계는 남긴다. 입력에 유의미한 대안이 없으면 새로 만들지 않는다.
+- decision.decision_confidence가 high이면 '고확신은 아니다', '확신은 중간 수준이다'처럼 확신을 낮추는 수식어를 쓰지 않는다. medium이나 low이면 Strategy 입력이 밝힌 범위에서만 확신의 제한을 쓰고 새로 덧붙이지 않는다. 투자의견과 확신 수준은 투자 판단 요약에서 결론짓고 다른 절의 마지막 문장에서 다시 결론짓지 않는다.
+- 실적 검토의 변화 원인과 지표 간 차이, 전망의 지속성과 가정을 보존한다. 해석을 모두 증가·감소 나열로 축약하지 않는다. 전망에서 설명한 가정이나 위험을 판단 한계에서 같은 문장으로 반복하지 않는다.
+
+출력 계약:
+- output_contract의 sections와 item key를 정확히 유지하고 다른 key를 추가하지 않는다.
+- 각 item의 card_keys에는 available_card_keys_by_component에서 실제 사용한 근거만 작성하고 required_card_keys_by_component의 필수 근거는 포함한다. 표의 카드·행 순서는 그대로 유지한다.
+{assembly_policy}
+- 밑줄로 시작하는 필드는 검증 전용이다. 그 값을 보이는 문장이나 표 셀에 노출하지 않는다.
+- 각 텍스트 item의 실제 완결 문장을 _claim_units.claim에 그대로 복사하고 문장별 사용 card_keys를 연결한다. 각 item의 _claim_units.card_keys 합집합은 item.card_keys와 정확히 같아야 한다.
+- data_limits는 residual_uncertainty의 의미와 required_limitations의 자료 기준을 독자용 문장으로 편집한다. 실제 작성 문장과 근거를 _claim_units에 연결하고 자료 기준의 category를 limitation_categories에 표시하되, category 이름과 card key는 문장에 쓰지 않는다. 두 입력이 모두 비어 있으면 paragraphs와 _claim_units를 빈 배열로 둔다.
+- data_limits에서 residual_uncertainty에 없는 판단 한계를 추가하지 않는다. required_limitations로 지정되지 않은 정상 공시 시차, 후행 사건의 과거 재무표 미반영, 재무 기여 미확인을 별도 한계 문장으로 붙이지 않는다. 문단 수를 채우지 말고 핵심 제약을 한 번 설명하는 것으로 충분하다.
+- available_charts가 있으면 requested_chart_keys와 chart_selection_details를 같은 길이와 순서로 작성한다. 각 차트는 최종 판단에 실제 사용된 card를 basis_card_keys로 연결한다. selection_reason은 내부 검증용 선택 이유로 작성한다. chart_observation은 chart_facts에서 직접 확인되는 사실만 한 문장으로 쓰고, investment_interpretation은 연결된 card의 Strategy 해석이 대상기업 판단에 미치는 의미만 한 문장으로 쓴다.
+
+작성 규칙:
+- 보이는 근거 표는 output_contract의 열 구성에 맞춰 확인된 사실과 Strategy가 설명한 투자 판단상 의미를 구분한다.
+- 카드에 reader_observation이 있으면 관찰 열은 그 표시값을 우선 사용하고 raw 숫자를 다시 환산하지 않는다.
+- 제품 card의 reconciliation이 matched가 아니면 해당 설명이나 표에서 `주요 제품·서비스 공시표 기준`임을 밝히고 회사 전체 매출 구성으로 확대하지 않는다. 같은 범위 설명을 문장마다 반복하지 않는다.
+- 관찰과 해석을 섞지 않고 strategy_interpretation의 의미와 입력에 제시된 판단 역할을 유지한다.
+- market_benchmark card는 명시된 benchmark_name 대비로 쓰고 selected_peer card는 명시된 회사명 대비로 쓴다.
+- industry_aggregate card가 없으면 업종·동종·산업 평균 비교 표현을 사용하지 않는다.
+- 수치 비교는 Strategy가 해석한 비교 카드의 비교 가능한 지표를 사용하며 target_peer_context가 지정한 범위를 유지한다. 문맥 카드로 전달된 비교도 recommendation_bridge의 논거를 설명하는 데 사용할 수 있다. 질적 비교는 선택된 peer.agent_analysis의 comparison_points와 Strategy 해석에 근거해 대상기업 판단에 필요한 차이만 설명한다. 비교 해석을 원자료나 추가적인 독립 증거로 취급하지 않는다.
+- 비교기업 관련 내용은 대상기업의 해당 논거를 설명하는 절에서 사용한다. 비교기업을 별도 평가하는 섹션을 만들거나 같은 비교를 여러 절에서 반복하지 않는다.
+- 비교 근거명은 비교기업 자체를 평가하지 말고 대상기업에서 확인된 상대성과가 판단을 어떻게 보강하거나 제한하는지 드러내게 작성한다.
+- 선정된 한 기업과의 비교를 업종 내·동종기업 전반·산업 평균 대비 결과로 확대하지 않으며, 1:1 비교 문장에는 비교기업명을 명시한다.
+- 가치평가 card의 comparison_scope가 none이면 배수를 수치로만 설명한다. 같은 산식·기준시점의 비교 card가 선택되지 않았다면 낮다·높다·저평가·고평가·가격 부담·가격 완충·할인이라는 상대적 가치판단을 만들지 않는다.
+- observation_basis=point_in_time인 card만으로 개선·악화·증가·감소 같은 시계열 변화를 주장하지 않는다.
+- 데이터 한계나 미공개 정보를 새 리스크로 승격하지 않는다.
+- 입력 숫자는 표시된 값과 단위를 그대로 사용하고 계산, 단위 환산, 임의 반올림을 하지 않는다.
+- 원천 evidence/claim/opinion ID, card key, Agent, prompt, validation, 절대 파일 경로를 보이는 문장에 쓰지 않는다.
+- 목표주가와 컨센서스를 작성하지 않는다. 투자의견이 바뀔 수 있는 조건은 residual_uncertainty에 Strategy가 제시한 것만 데이터 한계 절에서 한 번 서술하고 새로 만들지 않는다.
+- decision.opinion은 Buy=매수, Hold=중립, Sell=매도로 표시하며 최종 의견을 바꾸지 않는다. 입력 문장에 나온 Buy·Hold·Sell도 같은 한국어 의견명으로 바꿔 쓴다. 투자의견이 아닌 판단, 예컨대 가격 위치를 설명할 때는 매수·중립·매도라는 말을 쓰지 않고 풀어 쓴다. 기존 보유자·신규 진입자의 별도 대응으로 다시 작성하지 않는다.
+- 후속 공시·수치·사건을 확인하거나 향후 재검토하라는 작업 계획을 쓰지 않는다. residual_uncertainty가 제시한 의견 전환 조건은 작업 계획이 아니라 현재 판단의 한계이므로 그 의미를 보존한다. 입력에 없는 내용은 현재 판단에 반영할 수 없는 범위로만 설명한다.
+- 독자에게 보이는 한국어 문장은 간결한 '-다' 체로 통일하고 '-습니다' 체를 섞지 않는다.
+- 투자 판단 요약은 최종 의견과 결정적 이유, 최근 실적과 가격 평가는 earnings_review와 price_context, 향후 전망은 outlook의 성장 동인·가정과 예상 영향, 리스크는 전망을 약화시킬 요인, 데이터 한계는 자료 시점과 해석 범위를 쓴다. 같은 결론·수치·사건 설명을 표현만 바꿔 반복하지 않는다.
+- 같은 기업·제품·요약 근거를 공유해도 사건의 발생 시점이나 사업상 의미가 다르면 중복 설명으로 취급하지 않는다. report_insights의 유형이 같다는 이유로 서로 다른 사건을 하나의 포괄적 표현으로 대체하지 않는다.
+- 독립적인 논거와 가정에 맞춰 문단을 나눈다. 핵심 논거와 가정은 분량 때문에 생략하지 않고 같은 사실·해석의 반복만 줄인다. bullets는 빈 배열로 둔다.
+- inline HTML은 <strong>만 허용하며 Markdown이나 raw HTML 문서는 반환하지 않는다.
+- available_charts가 있으면 최종 판단의 결정적 관찰을 직접 보여주는 차트만 최대 허용 개수까지 선택한다. chart_selection_details의 basis_card_keys는 해당 차트의 compatible_basis_card_keys 안에서만 고른다. 같은 판단을 반복하는 차트는 하나만 고른다. 한 차트의 basis_card_keys가 다른 차트의 부분집합이고 같은 관찰을 보여주면 더 넓은 근거를 담은 차트 하나만 남긴다. 적절한 차트가 없으면 두 배열을 모두 비운다.
+- chart_observation과 investment_interpretation에는 `보여준다`, `확인할 수 있다`, `시각화한다`처럼 차트 기능을 설명하는 문구를 쓰지 않는다. 관찰과 판단 의미를 반복하지 않고 합계 220자 안팎을 권장하되 필요한 해석을 글자 수 때문에 생략하지 않는다.
+""".strip()
+
+
+def _is_editorial_packet(value: Any) -> bool:
+    return isinstance(value, dict) and value.get("packet_version") == EDITORIAL_PACKET_VERSION
+
+
+def _evidence_interpretation_column(packet: dict[str, Any]) -> str:
+    return "투자 판단에 미치는 의미"
+
+
+def _evidence_display_columns(packet: dict[str, Any]) -> tuple[str, ...]:
+    return ("핵심 근거", "확인된 수치·사실", "투자 판단에 미치는 의미")
+
+
+def _writer_contract_version(value: dict[str, Any]) -> str:
+    return str(value.get("packet_version") or EDITORIAL_PACKET_VERSION)
+
+
+def _normalize_writer_mode(value: str) -> str:
+    mode = str(value or DETERMINISTIC_WRITER_MODE).strip().lower()
+    if mode not in WRITER_MODES:
+        raise ValueError(
+            f"writer_mode must be one of: {', '.join(sorted(WRITER_MODES))}"
+        )
+    return mode
+
+
+def _validate_writer_input(value: dict[str, Any]) -> None:
+    if not _is_editorial_packet(value):
+        raise ValueError("writer input must be a writer editorial packet")
+    if value.get("strategy_contract_version") != STRATEGY_DECISION_VERSION:
+        raise ValueError(f"writer input requires a {STRATEGY_DECISION_VERSION} Strategy decision")
+    validate_writer_editorial_packet(value)
+
+
+def _enrich_writer_metadata(payload: dict[str, Any], writer_packet: dict[str, Any]) -> dict[str, Any]:
+    """Attach hidden card links only when visible locked Strategy meaning is unambiguous."""
+
+    enriched = json.loads(json.dumps(payload, ensure_ascii=False))
+    cards = _dict(writer_packet.get("cards"))
+    sections = _dict(enriched.get("sections"))
+    evidence_item = _dict(_dict(sections.get("key_evidence_table")).get("evidence_table"))
+    interpretation_map: dict[str, list[str]] = {}
+    for card_key in _clean_identifiers(
+        _dict(writer_packet.get("required_card_keys_by_component")).get("key_evidence_table")
+    ):
+        interpretation = str(_dict(cards.get(card_key)).get("strategy_interpretation") or "").strip()
+        interpretation_map.setdefault(interpretation, []).append(card_key)
+    for row in evidence_item.get("rows") or []:
+        if not isinstance(row, dict) or row.get("_card_key"):
+            continue
+        candidates = interpretation_map.get(str(row.get("해석") or "").strip(), [])
+        if len(candidates) != 1:
+            continue
+        card_key = candidates[0]
+        card = _dict(cards.get(card_key))
+        row["_card_key"] = card_key
+        row["_strategy_interpretation"] = card.get("strategy_interpretation")
+        row["_strategy_role"] = card.get("strategy_role")
+    if not evidence_item.get("card_keys"):
+        inferred_keys = [
+            str(row.get("_card_key") or "")
+            for row in evidence_item.get("rows") or []
+            if isinstance(row, dict) and row.get("_card_key")
+        ]
+        if len(inferred_keys) == len(evidence_item.get("rows") or []):
+            evidence_item["card_keys"] = inferred_keys
+
+    risk_item = _dict(_dict(sections.get("risk_monitoring_matrix")).get("risk_monitoring_table"))
+    risk_map: dict[str, list[dict[str, Any]]] = {}
+    for risk in writer_packet.get("risk_factors") or []:
+        if isinstance(risk, dict):
+            risk_map.setdefault(_visible_risk_summary(risk).strip(), []).append(risk)
+    for row in risk_item.get("rows") or []:
+        if not isinstance(row, dict) or row.get("_strategy_risk_summary"):
+            continue
+        candidates = risk_map.get(str(row.get("리스크") or "").strip(), [])
+        if len(candidates) != 1:
+            continue
+        risk = candidates[0]
+        row["_basis_card_keys"] = _clean_identifiers(risk.get("basis_card_keys"))
+        row["_strategy_risk_summary"] = risk.get("risk_summary")
+    if not risk_item.get("card_keys"):
+        risk_item["card_keys"] = list(
+            dict.fromkeys(
+                card_key
+                for row in risk_item.get("rows") or []
+                if isinstance(row, dict)
+                for card_key in _clean_identifiers(row.get("_basis_card_keys"))
+            )
+        )
+    return enriched
+
+
+def _stock_code(ticker: Any) -> str:
+    """Return the exchange code shown next to the company name (six digits for KRX listings)."""
+
+    text = str(ticker or "").strip()
+    match = re.fullmatch(r"(\d{6})\.K[SQ]", text, flags=re.IGNORECASE)
+    return match.group(1) if match else text
+
+
+def _find_card(cards: dict[str, Any], *, domain: str, axis: str) -> dict[str, Any]:
+    for card in cards.values():
+        if isinstance(card, dict) and card.get("domain") == domain and card.get("axis") == axis:
+            return card
+    return {}
+
+
+def _ok_number(value: Any) -> float | None:
+    """Return a finite number from a raw value or a {value, status} metric, else None."""
+
+    if isinstance(value, dict):
+        if value.get("status") not in (None, "ok"):
+            return None
+        value = value.get("value")
+    return float(value) if is_finite_number(value) else None
+
+
+def _krw_jo_eok(value: float) -> str:
+    """Format a won amount as 조/억원, rounded to 억원."""
+
+    total_eok = int(round(value / 100_000_000))
+    sign = "-" if total_eok < 0 else ""
+    jo, eok = divmod(abs(total_eok), 10_000)
+    if not jo:
+        return f"{sign}{eok:,}억원"
+    return f"{sign}{jo:,}조 {eok:,}억원" if eok else f"{sign}{jo:,}조원"
+
+
+def _signed_percent(value: float, suffix: str = "%") -> str:
+    return f"{value * 100:+.1f}{suffix}"
+
+
+def _report_key_metrics(writer_packet: dict[str, Any]) -> dict[str, Any]:
+    """Collect sidebar price and valuation figures from Strategy cards without an LLM."""
+
+    cards = _dict(writer_packet.get("cards"))
+    valuation = _dict(
+        _find_card(cards, domain="valuation", axis="selected_date_calculated").get("primary_observation")
+    )
+    absolute = _dict(_find_card(cards, domain="market", axis="absolute_trend").get("primary_observation"))
+    relative = _dict(_find_card(cards, domain="market", axis="relative_performance").get("primary_observation"))
+    momentum = _dict(_find_card(cards, domain="market", axis="momentum_volume").get("primary_observation"))
+    valuation_metrics = _dict(valuation.get("metrics"))
+    close_input = _dict(_dict(valuation.get("inputs")).get("selected_date_close"))
+    close = _ok_number(close_input)
+    close_date = close_input.get("as_of_date") if close is not None else None
+    if close is None:
+        close = _ok_number(_dict(absolute.get("metrics")).get("stock_close"))
+        close_date = absolute.get("as_of_date")
+    market_cap = _ok_number(valuation_metrics.get("market_cap"))
+    pe = _ok_number(valuation_metrics.get("trailing_pe"))
+    pb = _ok_number(valuation_metrics.get("price_to_book"))
+    p_op = _ok_number(valuation_metrics.get("price_to_operating_profit"))
+    position = _ok_number(_dict(momentum.get("metrics")).get("stock_position_52w"))
+    return_12m = _ok_number(_dict(absolute.get("metrics")).get("stock_return_12m"))
+    excess_12m = _ok_number(_dict(relative.get("metrics")).get("stock_excess_return_12m"))
+    benchmark = str(relative.get("benchmark_name") or "KOSPI")
+
+    def entry(group: str, label: str, value: float | None, display: Any) -> dict[str, str]:
+        return {
+            "group": group,
+            "label": label,
+            "value": display(value) if value is not None else MISSING_VALUE,
+        }
+
+    pe_entry = entry("가치평가", "P/E", pe, lambda value: _metric_display(value, "times"))
+    net_income = _ok_number(_dict(valuation.get("inputs")).get("ttm_net_income"))
+    if pe is None and net_income is not None and net_income <= 0:
+        # A loss-making earnings base has no meaningful P/E; say so instead of "missing".
+        pe_entry["value"] = "적자"
+    metrics = [
+        entry("시세", "종가", close, _price_display),
+        entry("시세", "시가총액", market_cap, _krw_jo_eok),
+        entry("시세", "52주 범위 내 위치", position, lambda value: f"{value * 100:.1f}%"),
+        pe_entry,
+        entry("가치평가", "P/B", pb, lambda value: _metric_display(value, "times")),
+    ]
+    if p_op is not None:
+        metrics.append(entry("가치평가", "P/영업이익", p_op, lambda value: _metric_display(value, "times")))
+    metrics.extend(
+        [
+            entry("수익률", "12개월 수익률", return_12m, _signed_percent),
+            entry(
+                "수익률",
+                f"{benchmark} 대비 12개월 초과수익률",
+                excess_12m,
+                lambda value: _signed_percent(value, "%p"),
+            ),
+        ]
+    )
+    market_date = (
+        close_date
+        or valuation.get("as_of_date")
+        or absolute.get("as_of_date")
+        or relative.get("as_of_date")
+        or MISSING_VALUE
+    )
+    return {"market_data_date": str(market_date), "key_metrics": metrics}
+
+
+def _qualify_partial_product_scope(
+    text: str,
+    writer_packet: dict[str, Any],
+    card_keys: Any,
+) -> str:
+    """Scope partial product disclosure from structured claim-card linkage."""
+
+    if not text or PRODUCT_DISCLOSURE_SCOPE_LABEL in text:
+        return text
+    if "financial.product_breakdown" not in _clean_identifiers(card_keys):
+        return text
+    product_card = _dict(_dict(writer_packet.get("cards")).get("financial.product_breakdown"))
+    reconciliation = _dict(
+        _dict(product_card.get("primary_observation")).get("reconciliation")
+    )
+    if not product_card or reconciliation.get("reconciliation_status") == "matched":
+        return text
+    return f"{PRODUCT_DISCLOSURE_SCOPE_LABEL}으로 보면, {text}"
+
+
+def _apply_deterministic_evidence_table(
+    payload: dict[str, Any],
+    writer_packet: dict[str, Any],
+) -> dict[str, Any]:
+    """Replace model-authored evidence cells with structured card displays."""
+
+    normalized = json.loads(json.dumps(payload, ensure_ascii=False))
+    sections = normalized.setdefault("sections", {})
+    evidence_section = sections.setdefault("key_evidence_table", {})
+    evidence_item = evidence_section.setdefault("evidence_table", {})
+    required = _clean_identifiers(
+        _dict(writer_packet.get("required_card_keys_by_component")).get("key_evidence_table")
+    )
+    cards = _dict(writer_packet.get("cards"))
+    label_rows = [
+        item
+        for item in evidence_item.get("_display_labels") or []
+        if isinstance(item, dict)
+    ]
+    label_keys = [str(item.get("card_key") or "").strip() for item in label_rows]
+    if label_keys != required:
+        raise HTMLReportWriterUnavailable(
+            "Writer evidence display labels must match required cards in order."
+        )
+    writer_labels = {
+        card_key: str(item.get("display_label") or "").strip()
+        for card_key, item in zip(required, label_rows)
+    }
+    if any(not value for value in writer_labels.values()):
+        raise HTMLReportWriterUnavailable(
+            "Writer evidence display labels must not be empty."
+        )
+    evidence_item["columns"] = list(_evidence_display_columns(writer_packet))
+    evidence_item["rows"] = [
+        {
+            "핵심 근거": replace_english_grade_labels(writer_labels[card_key]),
+            "확인된 수치·사실": replace_english_grade_labels(
+                _evidence_observation_text(card_key, card, cards)
+            ),
+            _evidence_interpretation_column(writer_packet): _reader_display_text(
+                _qualify_partial_product_scope(
+                    str(card.get("strategy_interpretation") or ""),
+                    writer_packet,
+                    [card_key],
+                )
+            ),
+            "_card_key": card_key,
+            "_strategy_interpretation": card.get("strategy_interpretation"),
+        }
+        for card_key in required
+        for card in [_dict(cards.get(card_key))]
+    ]
+    evidence_item["card_keys"] = required
+    evidence_item.pop("_display_labels", None)
+    return normalized
+
+
+def _apply_deterministic_risk_table(
+    payload: dict[str, Any],
+    writer_packet: dict[str, Any],
+) -> dict[str, Any]:
+    """Render Strategy-owned risk meaning and monitoring points without model drift."""
+
+    normalized = json.loads(json.dumps(payload, ensure_ascii=False))
+    sections = normalized.setdefault("sections", {})
+    risk_section = sections.setdefault("risk_monitoring_matrix", {})
+    risk_item = risk_section.setdefault("risk_monitoring_table", {})
+    risks = [item for item in writer_packet.get("risk_factors") or [] if isinstance(item, dict)]
+    risk_item["columns"] = list(RISK_DISPLAY_COLUMNS)
+    risk_item["rows"] = [
+        {
+            "리스크 요인": replace_english_grade_labels(
+                str(risk.get("display_title") or "").strip()
+            ),
+            "현재 확인된 내용": _reader_display_text(_visible_risk_summary(risk)),
+            "투자 판단에 미치는 영향": _reader_display_text(
+                str(risk.get("current_implication") or risk.get("monitoring_point") or "")
+            ),
+            "_basis_card_keys": _clean_identifiers(risk.get("basis_card_keys")),
+            "_strategy_risk_summary": risk.get("risk_summary"),
+        }
+        for risk in risks
+    ]
+    risk_item["card_keys"] = list(
+        dict.fromkeys(
+            card_key
+            for risk in risks
+            for card_key in _clean_identifiers(risk.get("basis_card_keys"))
+        )
+    )
+    return normalized
+
+
+def _evidence_observation_text(
+    card_key: str,
+    card: dict[str, Any],
+    cards: dict[str, Any] | None = None,
+) -> str:
+    """Build the reader-facing fact lines of one evidence row after the Writer call.
+
+    This is display formatting only: the Writer model input keeps the full card.
+    """
+
+    cards = cards or {}
+    observation = card.get("reader_observation") or card.get("primary_observation")
+    if card_key == "market.relative_performance":
+        return _market_relative_key_lines(card, cards) or _market_relative_observation_text(card, observation)
+    if card_key == "market.absolute_trend":
+        return _market_absolute_key_lines(card, cards) or _structured_observation_text(observation)
+    if card_key == "market.momentum_volume":
+        return _market_momentum_key_lines(card) or _structured_observation_text(observation)
+    if card_key.startswith("peer."):
+        return _peer_observation_text(observation)
+    if card_key == "financial.balance_sheet":
+        return _balance_sheet_observation_text(observation)
+    if card_key == "financial.product_breakdown":
+        return _product_observation_text(observation)
+    if card_key == "valuation.selected_date":
+        shown = {
+            key
+            for key, metric in _card_metrics(card).items()
+            if _dict(metric).get("status") in (None, "ok") and is_finite_number(_dict(metric).get("value"))
+        }
+        return _join_fact_lines(
+            _valuation_observation_text(observation),
+            _earnings_base_note(card, "earnings_base_warnings", shown),
+        )
+    if card_key == "valuation.prior_year_end":
+        return _prior_year_end_valuation_text(card) or _structured_observation_text(observation)
+    return _structured_observation_text(observation)
+
+
+def _card_metrics(card: dict[str, Any]) -> dict[str, Any]:
+    return _dict(_dict(card.get("primary_observation")).get("metrics"))
+
+
+def _metric_line(label: str, metrics: dict[str, Any], key: str, display: Any) -> str:
+    value = metrics.get(key)
+    return f"{label}: {display(value)}" if is_finite_number(value) else ""
+
+
+def _market_lines(card: dict[str, Any], lines: list[str]) -> str:
+    """Return dated fact lines, or "" when no decision metric is available."""
+
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    as_of = _dict(card.get("primary_observation")).get("as_of_date")
+    return "\n".join([f"기준일: {as_of}", *lines] if as_of else lines)
+
+
+def _market_relative_key_lines(card: dict[str, Any], cards: dict[str, Any]) -> str:
+    """Show the 12-month comparison and the 3-month excess return only."""
+
+    metrics = _card_metrics(card)
+    benchmark = str(
+        _dict(card.get("comparison_entities")).get("benchmark_name")
+        or _dict(card.get("primary_observation")).get("benchmark_name")
+        or "시장"
+    ).strip()
+    # The target's own return lives on the absolute-trend card of the same packet.
+    stock_metrics = {**_card_metrics(_find_card(cards, domain="market", axis="absolute_trend")), **metrics}
+    return _market_lines(
+        card,
+        [
+            _metric_line("12개월 수익률", stock_metrics, "stock_return_12m", _ratio_percent),
+            _metric_line(f"{benchmark} 12개월 수익률", metrics, "kospi_return_12m", _ratio_percent),
+            _metric_line(f"{benchmark} 대비 12개월 초과수익률", metrics, "stock_excess_return_12m", _signed_percentage_point),
+            _metric_line(f"{benchmark} 대비 3개월 초과수익률", metrics, "stock_excess_return_3m", _signed_percentage_point),
+        ],
+    )
+
+
+def _market_absolute_key_lines(card: dict[str, Any], cards: dict[str, Any]) -> str:
+    """Show 12- and 3-month returns, the 52-week position and moving-average gaps."""
+
+    metrics = _card_metrics(card)
+    momentum = _card_metrics(_find_card(cards, domain="market", axis="momentum_volume"))
+    position_metrics = {**momentum, **metrics}
+    averages = " · ".join(
+        f"{days}일 {_ratio_percent(metrics[key])}"
+        for days in (120, 200)
+        for key in [f"stock_close_to_ma{days}"]
+        if is_finite_number(metrics.get(key))
+    )
+    return _market_lines(
+        card,
+        [
+            _metric_line("12개월 수익률", metrics, "stock_return_12m", _ratio_percent),
+            _metric_line("3개월 수익률", metrics, "stock_return_3m", _ratio_percent),
+            _metric_line("52주 범위 내 위치", position_metrics, "stock_position_52w", _ratio_percent),
+            f"이동평균 대비: {averages}" if averages else "",
+        ],
+    )
+
+
+def _market_momentum_key_lines(card: dict[str, Any]) -> str:
+    """Show the 52-week position, drawdown from the high, volume and RSI."""
+
+    metrics = _card_metrics(card)
+    return _market_lines(
+        card,
+        [
+            _metric_line("52주 범위 내 위치", metrics, "stock_position_52w", _ratio_percent),
+            _metric_line("1년 고점 대비 하락률", metrics, "stock_current_drawdown_1y", _ratio_percent),
+            _metric_line("20일 평균 대비 거래량", metrics, "stock_volume_ratio_20", lambda value: f"{float(value):,.2f}배"),
+            _metric_line("14일 RSI", metrics, "stock_rsi_14", lambda value: f"{float(value):,.2f}"),
+        ],
+    )
+
+
+_VALUATION_PAIR_LABELS = {
+    "trailing_pe": "P/E",
+    "price_to_book": "P/B",
+    "price_to_sales": "P/S",
+    "price_to_operating_profit": "P/영업이익",
+    "enterprise_value_to_revenue": "EV/매출",
+    "enterprise_value_to_ebitda": "EV/EBITDA",
+}
+# Multiples whose denominator is an earnings figure.
+_EARNINGS_BASED_MULTIPLES = {"trailing_pe", "price_to_operating_profit", "enterprise_value_to_ebitda"}
+_EARNINGS_BASE_WARNING_TEXT = {
+    "ttm_includes_loss_half_year": "최근 4개 분기 이익에 손실을 낸 반기가 포함됨",
+    "ttm_net_income_far_below_operating_profit": "최근 4개 분기 순이익이 영업이익보다 크게 낮음",
+}
+
+
+def _prior_year_end_valuation_text(card: dict[str, Any]) -> str:
+    """Show each multiple at the prior fiscal year end and now, with the close change."""
+
+    observation = _dict(card.get("primary_observation"))
+    reference_date = str(observation.get("reference_date") or "").strip()
+    current_date = str(observation.get("current_as_of_date") or "").strip()
+
+    def dated(text: str, date: str) -> str:
+        return f"{text}({date})" if date else text
+
+    lines = []
+    shown_keys = set()
+    for pair in observation.get("pairs") or []:
+        pair = _dict(pair)
+        key = str(pair.get("metric_key") or "")
+        label = _VALUATION_PAIR_LABELS.get(key)
+        reference, current = pair.get("reference_value"), pair.get("current_value")
+        if not label or not is_finite_number(reference) or not is_finite_number(current):
+            continue
+        line = (
+            f"{label}: {dated(_metric_display(reference, 'times'), reference_date)}"
+            f" → {dated(_metric_display(current, 'times'), current_date)}"
+        )
+        if str(pair.get("comparability") or "comparable") != "comparable":
+            line += " (직접 비교 제한)"
+        lines.append(line)
+        shown_keys.add(key)
+    close = _dict(observation.get("close"))
+    if is_finite_number(close.get("reference")) and is_finite_number(close.get("current")):
+        change = (
+            f" ({_signed_percent(float(close['change_rate']), '%')})"
+            if is_finite_number(close.get("change_rate"))
+            else ""
+        )
+        lines.append(
+            f"종가: {dated(_price_display(close['reference']), reference_date)}"
+            f" → {dated(_price_display(close['current']), current_date)}{change}"
+        )
+    if not lines:
+        return ""
+    lines.append(_earnings_base_note(card, "current_earnings_base_warnings", shown_keys))
+    return _join_fact_lines(*lines)
+
+
+def _earnings_base_note(card: dict[str, Any], field: str, shown_keys: set[str]) -> str:
+    """Translate earnings-base warning codes into one reader note.
+
+    The note appears only when an earnings-based multiple is displayed; unknown codes
+    get a generic reason instead of exposing the code.
+    """
+
+    codes = [str(code) for code in _dict(card.get("primary_observation")).get(field) or [] if str(code).strip()]
+    if not codes or not shown_keys & _EARNINGS_BASED_MULTIPLES:
+        return ""
+    reasons = list(
+        dict.fromkeys(
+            _EARNINGS_BASE_WARNING_TEXT.get(code, "이익 기준에 일시적 요인이 섞였을 수 있음")
+            for code in codes
+        )
+    )
+    return f"주: {', '.join(reasons)}. 이익 기준 배수는 해석에 유의"
+
+
+def _join_fact_lines(*lines: str) -> str:
+    text = "\n".join(line for line in lines if line and line != MISSING_VALUE)
+    return text or MISSING_VALUE
+
+
+def _market_relative_observation_text(card: dict[str, Any], value: Any) -> str:
+    observation = _dict(value)
+    metrics = _dict(observation.get("지표"))
+    benchmark = str(
+        _dict(card.get("comparison_entities")).get("benchmark_name")
+        or _dict(card.get("primary_observation")).get("benchmark_name")
+        or "시장"
+    ).strip()
+    period = str(
+        _dict(_dict(card.get("primary_observation")).get("periods")).get(
+            "stock_period_excess_return"
+        )
+        or ""
+    ).replace("..", "~")
+    lines = [f"기준일: {observation.get('기준일')}" if observation.get("기준일") else ""]
+    for label, metric_value in metrics.items():
+        display_label = str(label).replace("5일", "5거래일").replace("20일", "20거래일").replace("60일", "60거래일")
+        if display_label.startswith("조회기간"):
+            display_label = f"요청기간({period}) {benchmark} 대비 초과수익률" if period else display_label.replace("조회기간", "요청기간")
+        display_value = str(metric_value)
+        if "초과수익률" in display_label and display_value.endswith("%"):
+            display_value = f"{display_value[:-1]}%p"
+        lines.append(f"{display_label}: {display_value}")
+    if any("60거래일" in line for line in lines):
+        lines.append("주: 60거래일 수익률은 분석 시작일 이전 주가를 포함하여 산출함")
+    return "\n".join(line for line in lines if line) or MISSING_VALUE
+
+
+def _peer_observation_text(value: Any) -> str:
+    observation = _dict(value)
+    target = str(observation.get("대상 기업") or "대상 기업").strip()
+    metrics = [item for item in observation.get("지표") or [] if isinstance(item, dict)]
+    bases = list(
+        dict.fromkeys(
+            _plain_korean_text(str(item.get("비교 기준") or "").strip())
+            for item in metrics
+            if str(item.get("비교 기준") or "").strip()
+        )
+    )
+    lines = [f"비교 기준: {', '.join(bases)}"] if bases else []
+    for item in metrics:
+        metric_name = str(item.get("지표명") or "지표").strip()
+        peer_name = str(item.get("비교 기업명") or "비교기업").strip()
+        lines.append(
+            f"{metric_name}: {target} {item.get('대상')} · {peer_name} {item.get('비교 기업')}"
+        )
+    return "\n".join(lines) or _structured_observation_text(value)
+
+
+def _balance_sheet_observation_text(value: Any) -> str:
+    observation = _dict(value)
+    lines = []
+    if observation.get("기준일"):
+        lines.append(f"기준일: {observation['기준일']}")
+    scale = [
+        f"{key}: {observation[key]}"
+        for key in ("총자산", "총부채", "총자본")
+        if observation.get(key)
+    ]
+    ratios = [
+        f"{key}: {observation[key]}"
+        for key in ("유동비율", "현금비율", "부채비율")
+        if observation.get(key)
+    ]
+    if scale:
+        lines.append(" · ".join(scale))
+    if ratios:
+        lines.append(" · ".join(ratios))
+    return "\n".join(lines) or _structured_observation_text(value)
+
+
+def _product_observation_text(value: Any) -> str:
+    observation = _dict(value)
+    period = str(observation.get("공시 기준") or "").strip()
+    unit = str(observation.get("공시 단위") or "").strip()
+    header = " · ".join(
+        text
+        for text in (
+            f"공시 기준: {period}" if period else "",
+            f"단위: {unit}" if unit else "",
+        )
+        if text
+    )
+    lines = [header] if header else []
+    for item in observation.get("제품") or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("제품명") or "제품").strip()
+        revenue = str(item.get("매출액") or MISSING_VALUE).strip()
+        share = str(item.get("비중") or "").strip()
+        lines.append(f"{name}: {revenue}{f' ({share})' if share else ''}")
+    scope = str(observation.get("범위") or "").strip()
+    if scope:
+        lines.append(f"범위: {scope}")
+    return "\n".join(lines) or _structured_observation_text(value)
+
+
+def _valuation_observation_text(value: Any) -> str:
+    observation = _dict(value)
+    lines = []
+    if observation.get("기준일"):
+        lines.append(f"기준일: {observation['기준일']}")
+    metrics = _dict(observation.get("지표"))
+    if metrics:
+        lines.append(" · ".join(f"{key}: {metric}" for key, metric in metrics.items()))
+    return "\n".join(lines) or _structured_observation_text(value)
+
+
+# Lowercase snake_case keys are handoff field names, not reader labels.
+_INTERNAL_KEY_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+# Reader-facing prose fields, in priority order, of an internally keyed observation.
+_READER_TEXT_KEYS = ("observation", "text", "summary", "event_summary", "title")
+_READER_DATE_KEYS = ("as_of_date", "valuation_date")
+_READER_METRIC_LABELS = {
+    "market_cap": "시가총액",
+    "trailing_pe": "P/E",
+    "price_to_sales": "P/S",
+    "price_to_book": "P/B",
+    "enterprise_value_to_revenue": "EV/매출",
+    "enterprise_value_to_ebitda": "EV/EBITDA",
+}
+_METRIC_VALUE_KEYS = {"value", "unit", "status"}
+
+
+def _structured_observation_text(value: Any, *, depth: int = 0) -> str:
+    """Render an observation for readers without exposing internal field names."""
+
+    if isinstance(value, dict):
+        reader_text = _reader_text_field(value)
+        if reader_text:
+            return reader_text
+        parts = []
+        for key, child in value.items():
+            if child in (None, "", [], {}):
+                continue
+            part = _structured_observation_part(str(key), child, depth=depth)
+            if part:
+                parts.append(part)
+        separator = "\n" if depth == 0 else " · "
+        return separator.join(parts) if parts else MISSING_VALUE
+    if isinstance(value, list):
+        parts = [
+            _structured_observation_text(child, depth=depth + 1)
+            for child in value
+            if child not in (None, "", [], {})
+        ]
+        separator = "\n" if depth == 0 else "; "
+        return separator.join(parts) if parts else MISSING_VALUE
+    if isinstance(value, bool):
+        return "예" if value else "아니오"
+    text = str(value or "").strip()
+    return text or MISSING_VALUE
+
+
+def _reader_text_field(value: dict[str, Any]) -> str:
+    for key in _READER_TEXT_KEYS:
+        text = value.get(key)
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return ""
+
+
+def _structured_observation_part(key: str, child: Any, *, depth: int) -> str:
+    if not _INTERNAL_KEY_PATTERN.match(key):
+        return f"{key}: {_structured_observation_text(child, depth=depth + 1)}"
+    if key in _READER_DATE_KEYS:
+        return f"기준일: {_structured_observation_text(child, depth=depth + 1)}"
+    if key == "metrics" and isinstance(child, dict):
+        metrics = [
+            text
+            for metric_key, metric in child.items()
+            for text in [_reader_metric_text(str(metric_key), metric)]
+            if text
+        ]
+        return " · ".join(metrics)
+    return _reader_metric_text(key, child)
+
+
+def _reader_metric_text(key: str, metric: Any) -> str:
+    """Format one known metric as "label: value unit"; unknown keys stay hidden."""
+
+    label = _READER_METRIC_LABELS.get(key)
+    if not label:
+        return ""
+    if isinstance(metric, dict):
+        if not set(metric) <= _METRIC_VALUE_KEYS:
+            return ""
+        if metric.get("status") not in (None, "ok") or metric.get("value") is None:
+            return ""
+        value, unit = metric.get("value"), str(metric.get("unit") or "")
+    elif isinstance(metric, (int, float)) and not isinstance(metric, bool):
+        value, unit = metric, "KRW" if key == "market_cap" else "times"
+    else:
+        return ""
+    if unit in {"KRW", "원"}:
+        return f"{label}: {_krw_100m(value)}"
+    if unit == "ratio":
+        return f"{label}: {_ratio_percent(value)}"
+    return f"{label}: {_metric_display(value, unit)}"
+
+
+def _replace_visible_card_keys(payload: dict[str, Any], writer_packet: dict[str, Any]) -> dict[str, Any]:
+    labels = {
+        card_key: str(card.get("label") or card_key)
+        for card_key, card in _dict(writer_packet.get("cards")).items()
+        if isinstance(card, dict)
+    }
+
+    def replace(value: Any, *, hidden: bool = False) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: replace(
+                    child,
+                    hidden=(
+                        hidden
+                        or (
+                            str(key).startswith("_")
+                            and key != "_claim_units"
+                        )
+                        or key
+                        in {
+                            "card_keys",
+                            "grounding_refs",
+                            "limitation_categories",
+                        }
+                    ),
+                )
+                for key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [replace(child, hidden=hidden) for child in value]
+        if not hidden and isinstance(value, str):
+            for card_key in sorted(labels, key=len, reverse=True):
+                value = value.replace(card_key, labels[card_key])
+        return value
+
+    return replace(payload)
+
+
+def _visible_risk_summary(risk: dict[str, Any]) -> str:
+    summary = str(risk.get("reader_summary") or risk.get("risk_summary") or "").strip()
+    qualifier = str(risk.get("scope_qualifier") or "").strip()
+    if qualifier and qualifier != "not_applicable" and qualifier not in summary:
+        return f"{qualifier}: {summary}"
+    return summary
+
+
+def _ensure_claim_units_visible(
+    paragraphs: list[str],
+    claim_units: list[dict[str, Any]],
+) -> list[str]:
+    claims = [
+        str(unit.get("claim") or "").strip()
+        for unit in claim_units
+        if str(unit.get("claim") or "").strip()
+    ]
+    if not claims:
+        return paragraphs
+
+    updated = list(paragraphs)
+    if not updated or updated == [MISSING_VALUE]:
+        updated = [claims[0]]
+
+    visible_text = " ".join(updated)
+    missing_claims = [claim for claim in claims if claim not in visible_text]
+    # Preserve the Writer's explanation and paragraph structure. Missing explicit
+    # claims may be appended, but must never replace already written paragraphs.
+    updated.extend(missing_claims)
+    return updated
+
+
+def _normalize_text(value: Any, *, preserve_claim_units: bool = False, allow_empty: bool = False) -> dict[str, Any]:
+    payload = _dict(value)
+    paragraphs = _clean_list(payload.get("paragraphs"))
+    bullets = _clean_list(payload.get("bullets"))
+    if not paragraphs and not bullets and not allow_empty:
+        paragraphs = [MISSING_VALUE]
+    result = {
+        "paragraphs": paragraphs,
+        "bullets": bullets,
+        "grounding_refs": _clean_refs(payload.get("grounding_refs")),
+    }
+    if "card_keys" in payload:
+        result["card_keys"] = _clean_identifiers(payload.get("card_keys"))
+    if "_claim_units" in payload:
+        result["_claim_units"] = [
+            {
+                "claim": _plain_korean_text(str(unit.get("claim") or "").strip()),
+                "card_keys": _clean_identifiers(unit.get("card_keys")),
+                "limitation_categories": _clean_identifiers(
+                    unit.get("limitation_categories")
+                ),
+            }
+            for unit in payload.get("_claim_units") or []
+            if isinstance(unit, dict) and str(unit.get("claim") or "").strip()
+        ]
+    declared_limitations = _clean_identifiers(payload.get("_limitation_categories"))
+    if not declared_limitations and result.get("_claim_units"):
+        declared_limitations = list(
+            dict.fromkeys(
+                category
+                for unit in result["_claim_units"]
+                for category in _clean_identifiers(unit.get("limitation_categories"))
+            )
+        )
+    if declared_limitations:
+        result["_limitation_categories"] = declared_limitations
+    if preserve_claim_units and result.get("_claim_units"):
+        result["paragraphs"] = _ensure_claim_units_visible(
+            result["paragraphs"],
+            result["_claim_units"],
+        )
+    return result
+
+
+def _normalize_table(value: Any, *, preserve_strategy_values: bool = False) -> dict[str, Any]:
+    payload = _dict(value)
+    columns = _clean_list(payload.get("columns")) or ["항목", "내용"]
+    rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
+    if not rows:
+        rows = [[MISSING_VALUE for _ in columns]]
+    result = {
+        "columns": columns,
+        "rows": _plain_korean_rows(rows, preserve_strategy_values=preserve_strategy_values),
+        "grounding_refs": _clean_refs(payload.get("grounding_refs")),
+    }
+    if "card_keys" in payload:
+        result["card_keys"] = _clean_identifiers(payload.get("card_keys"))
+    return result
+
+
+def _clean_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [_plain_korean_text(str(item).strip()) for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [_plain_korean_text(value.strip())]
+    return []
+
+
+def _clean_refs(value: Any) -> list[str]:
+    refs = _clean_list(value)
+    return list(dict.fromkeys(refs))
+
+
+def _clean_identifiers(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return list(dict.fromkeys(str(item).strip() for item in value if str(item).strip()))
+
+
+def _plain_korean_rows(rows: list[Any], *, preserve_strategy_values: bool = False) -> list[Any]:
+    normalized = []
+    for row in rows:
+        if not isinstance(row, dict):
+            normalized.append(_plain_korean_value(row))
+            continue
+        normalized.append(
+            {
+                _plain_korean_text(str(key)): (
+                    value
+                    if str(key).startswith("_")
+                    or preserve_strategy_values
+                    and str(key)
+                    in {
+                        "해석",
+                        "투자의견 영향",
+                        "리스크",
+                        "투자 해석",
+                        "영향",
+                        "현재 확인된 내용",
+                    }
+                    else _plain_korean_value(value)
+                )
+                for key, value in row.items()
+            }
+        )
+    return normalized
+
+
+def _plain_korean_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _plain_korean_text(value)
+    if isinstance(value, list):
+        return [_plain_korean_value(item) for item in value]
+    if isinstance(value, dict):
+        return {_plain_korean_text(str(key)): _plain_korean_value(item) for key, item in value.items()}
+    return value
+
+
+def _plain_korean_text(text: str) -> str:
+    text = re.sub(
+        r"(?<![A-Za-z0-9_])(\d{4})\s+HALF\s+YTD(?![A-Za-z0-9_])",
+        lambda match: f"{match.group(1)}년 반기 누적",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?<![A-Za-z0-9_])(\d{4})\s+HALF\s+누적\s+기준(?![A-Za-z0-9_])",
+        lambda match: f"{match.group(1)}년 반기 누적",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?<![A-Za-z0-9_])(\d{4})\s+Q([1-4])\s+YTD(?![A-Za-z0-9_])",
+        lambda match: f"{match.group(1)}년 {match.group(2)}분기 누적",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?<![A-Za-z0-9_])(\d{4})\s+(?:ANNUAL[\s_-]+)?FULL[\s_-]+YEAR(?![A-Za-z0-9_])",
+        lambda match: f"{match.group(1)}년 연간 실적",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"(?<!\d)(\d{4})\s*반기", lambda match: f"{match.group(1)}년 반기", text)
+    text = re.sub(
+        r"(?<![\d.])-?\d+\.\d{3,}(?![\d.])",
+        lambda match: f"{float(match.group(0)):.2f}",
+        text,
+    )
+    replacements = [
+        (r"(?<![A-Za-z0-9_])YTD(?![A-Za-z0-9_])", "누적 기준"),
+        (r"(?<![A-Za-z0-9_])FULL[\s_-]+YEAR(?![A-Za-z0-9_])", "연간 실적"),
+        (r"(?<![A-Za-z0-9_])peers?(?![A-Za-z0-9_])", "비교기업"),
+        (r"피어", "비교기업"),
+        (r"(?<![A-Za-z0-9_])catalysts?(?![A-Za-z0-9_])", "촉매"),
+        (r"(?<![A-Za-z0-9_])monitoring(?![A-Za-z0-9_])", "확인"),
+        (r"선택일 계산 밸류에이션", "기준일 밸류에이션"),
+        (r"선택일 계산 배수", "기준일 산출 배수"),
+        (r"선택일 계산 기준", "기준일 현재"),
+        (r"멀티플 프리미엄", "밸류에이션 프리미엄"),
+        (r"비교기업 비교", "비교기업 분석"),
+        (
+            r"주요 제품·서비스 공시표는 주요 제품·서비스 공시표 기준이며",
+            "제품별 매출 구성은 주요 제품·서비스 공시표 기준이며",
+        ),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    text = (
+        text.replace("누적와", "누적과")
+        .replace("누적는", "누적은")
+        .replace("비교기업 분석는", "비교기업 분석은")
+    )
+    return text
+
+
+def _reader_display_text(text: str) -> str:
+    """Reader-display wording for deterministic table cells.
+
+    Output-only: LLM input assembly never calls this function.
+    """
+
+    return replace_english_grade_labels(_plain_korean_text(text))

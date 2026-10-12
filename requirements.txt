@@ -1,0 +1,27 @@
+# Runtime dependencies for the integrated Financial_Agent pipeline.
+# Install with:
+#   python -m pip install -r requirements.txt
+# Evaluation and test extras are declared in pyproject.toml:
+#   python -m pip install -e ".[eval,dev]"
+
+pyyaml>=6.0
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+numpy>=1.24
+pandas>=2.0
+pyarrow>=14.0
+sentence-transformers>=2.2
+kss>=6.0.6
+kiwipiepy>=0.17.0
+openai>=1.68.0
+jsonschema>=4.18
+tiktoken>=0.7
+tqdm>=4.66
+langgraph>=0.2
+pykrx>=1.0.48
+
+# Required by YFinance_Agent runtime paths.
+yfinance>=0.2.40
+matplotlib>=3.7
+python-dotenv>=1.0

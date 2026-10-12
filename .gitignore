@@ -1,0 +1,85 @@
+# Environment and secrets
+.env
+.env.*
+*.env
+configs/.env
+!.env.example
+!*.env.example
+
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
+tmp/
+
+# Logs and runtime outputs
+logs/
+*.log
+Output_total*/
+
+# Portable ablation data bundle and experiment outputs at the repo root (kept in Google Drive, never Git)
+/evaluation/
+/evaluations/
+/references/
+/reports/
+/status/
+/prepared_inputs/
+/handoff/
+/collected_data/
+/repo/
+/experiments/
+/real_report/
+/Output_*/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Portable ablation bundle extracted at the repo root (kept out of Git)
+/financial_agent_ablation_report_bundle_*.zip
+/SHA256SUMS.txt
+/bundle_manifest.json
+/BUNDLE_README.md
+/ABLATION_HANDOFF_*.md
+
+# Private development records and handoff artifacts
+/docs/history/
+/docs/ablation_handoff/
+/docs/*HANDOFF*.md
+/private_audit/
+/progress_report_to_professor.md
+/summary.md
+/*_PLAN.md
+/ablation/requests/
+/ablation/responses/
+/ablation/logs/
+
+# Code-only release: generated reports, results, bundles and credentials
+/final_reports*/
+/strategy_decisions/
+/ablation/results/
+/ablation/run_config/recover_*.py
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.pdf
+*.hwp
+*.hwpx
+*.odt
+*.pem
+*.key
+id_rsa*
+id_ed25519*
